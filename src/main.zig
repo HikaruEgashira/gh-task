@@ -12,6 +12,7 @@ const usage_text =
     \\Commands:
     \\  add <title> [-s status]      Add task (default: first column)
     \\  list, ls                     Show kanban board
+    \\  view [column]                List tasks by column
     \\  move <id> <status>           Move task to column
     \\  rm <id>                      Remove a task
     \\  edit <id> <new-title>        Edit task title
@@ -46,6 +47,8 @@ pub fn main() !void {
         return runAdd(allocator, args[2..], out, err);
     } else if (std.mem.eql(u8, cmd, "list") or std.mem.eql(u8, cmd, "ls")) {
         return runList(allocator, out);
+    } else if (std.mem.eql(u8, cmd, "view")) {
+        return runView(allocator, args[2..], out);
     } else if (std.mem.eql(u8, cmd, "move")) {
         return runMove(allocator, args[2..], out, err);
     } else if (std.mem.eql(u8, cmd, "edit")) {
@@ -207,6 +210,41 @@ fn runRemove(allocator: std.mem.Allocator, args: []const []const u8, out: std.fs
     defer allocator.free(title);
 
     writeStr(out, "Removed #{d}: {s}\n", .{ id, title });
+}
+
+fn runView(allocator: std.mem.Allocator, args: []const []const u8, out: std.fs.File) !void {
+    var s = try loadStore(allocator);
+    defer s.deinit();
+
+    const colors = [_][]const u8{ "\x1b[1;33m", "\x1b[1;36m", "\x1b[1;32m", "\x1b[1;35m", "\x1b[1;34m" };
+    const reset = "\x1b[0m";
+    const dim = "\x1b[2m";
+
+    const query = if (args.len > 0) std.mem.join(allocator, " ", args) catch null else null;
+    defer if (query) |q| allocator.free(q);
+
+    const filter: ?[]const u8 = if (query) |q| s.findColumn(q) else null;
+
+    for (s.columns.items, 0..) |col, ci| {
+        if (filter) |f| {
+            if (!std.mem.eql(u8, col, f)) continue;
+        }
+
+        const count = s.countByStatus(col);
+        const color = colors[ci % colors.len];
+        writeStr(out, "\n{s}{s} ({d}){s}\n", .{ color, col, count, reset });
+
+        var found = false;
+        for (s.tasks.items) |task| {
+            if (std.mem.eql(u8, task.status, col)) {
+                writeStr(out, "  {s}#{d}{s} {s}\n", .{ dim, task.id, reset, task.title });
+                found = true;
+            }
+        }
+        if (!found) {
+            writeStr(out, "  {s}(empty){s}\n", .{ dim, reset });
+        }
+    }
 }
 
 fn runColumns(allocator: std.mem.Allocator, out: std.fs.File) !void {
