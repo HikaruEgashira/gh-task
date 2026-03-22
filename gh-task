@@ -1,0 +1,164 @@
+#!/usr/bin/env bash
+set -e
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+source "$SCRIPT_DIR/lib/store.sh"
+source "$SCRIPT_DIR/lib/kanban.sh"
+
+usage() {
+  cat <<EOF
+Usage: gh task <command> [options]
+
+Kanban-based task manager for your terminal.
+
+Commands:
+  add <title> [-s status]   Add a new task (default: todo)
+  list, ls                  Show kanban board
+  move [id]                 Move task to another column
+  done [id]                 Mark task as done
+  start [id]                Mark task as doing
+  edit [id]                 Edit task title
+  rm [id]                   Remove a task
+  -- <command>              Select task, then execute command with task title
+
+Statuses: todo, doing, done
+
+Examples:
+  gh task add "Fix login bug"
+  gh task add "Deploy v2" -s doing
+  gh task move
+  gh task done
+  gh task ls
+  gh task -- echo
+EOF
+}
+
+cmd_add() {
+  local title="" status="todo"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -s|--status) status="$2"; shift 2 ;;
+      *) title="$title $1"; shift ;;
+    esac
+  done
+  title="${title# }"
+
+  if [[ -z "$title" ]]; then
+    echo "Error: title is required" >&2
+    echo "Usage: gh task add <title> [-s status]" >&2
+    return 1
+  fi
+
+  local id
+  id=$(add_task "$title" "$status")
+  echo "Created #$id: $title [$status]"
+}
+
+cmd_list() {
+  render_kanban
+}
+
+cmd_move() {
+  local id="${1:-}"
+  if [[ -z "$id" ]]; then
+    id=$(select_task "Move task") || return 1
+  fi
+
+  local current
+  current=$(get_task "$id" | jq -r '.status')
+  if [[ -z "$current" || "$current" == "null" ]]; then
+    echo "Task #$id not found" >&2
+    return 1
+  fi
+
+  local new_status
+  new_status=$(printf "todo\ndoing\ndone" | fzf --prompt="Move #$id to> ") || return 1
+
+  update_task_status "$id" "$new_status"
+  echo "Moved #$id → $new_status"
+}
+
+cmd_done() {
+  local id="${1:-}"
+  if [[ -z "$id" ]]; then
+    id=$(select_task "Mark as done" "todo doing") || {
+      # fallback: select from all non-done
+      id=$(select_task "Mark as done") || return 1
+    }
+  fi
+
+  update_task_status "$id" "done"
+  local title
+  title=$(get_task "$id" | jq -r '.title')
+  echo "Done #$id: $title ✓"
+}
+
+cmd_start() {
+  local id="${1:-}"
+  if [[ -z "$id" ]]; then
+    id=$(select_task "Start task" "todo") || {
+      id=$(select_task "Start task") || return 1
+    }
+  fi
+
+  update_task_status "$id" "doing"
+  local title
+  title=$(get_task "$id" | jq -r '.title')
+  echo "Started #$id: $title"
+}
+
+cmd_edit() {
+  local id="${1:-}"
+  if [[ -z "$id" ]]; then
+    id=$(select_task "Edit task") || return 1
+  fi
+
+  local current_title
+  current_title=$(get_task "$id" | jq -r '.title')
+  if [[ -z "$current_title" || "$current_title" == "null" ]]; then
+    echo "Task #$id not found" >&2
+    return 1
+  fi
+
+  local new_title
+  read -r -e -i "$current_title" -p "Title: " new_title
+  if [[ -n "$new_title" && "$new_title" != "$current_title" ]]; then
+    update_task_title "$id" "$new_title"
+    echo "Updated #$id: $new_title"
+  fi
+}
+
+cmd_rm() {
+  local id="${1:-}"
+  if [[ -z "$id" ]]; then
+    id=$(select_task "Remove task") || return 1
+  fi
+
+  local title
+  title=$(get_task "$id" | jq -r '.title')
+  remove_task "$id"
+  echo "Removed #$id: $title"
+}
+
+cmd_exec() {
+  local id
+  id=$(select_task "Select task") || return 1
+
+  local title
+  title=$(get_task "$id" | jq -r '.title')
+  "$@" "$title"
+}
+
+# Main
+case "${1:-}" in
+  add)        shift; cmd_add "$@" ;;
+  list|ls|"") cmd_list ;;
+  move)       shift; cmd_move "$@" ;;
+  done)       shift; cmd_done "$@" ;;
+  start)      shift; cmd_start "$@" ;;
+  edit)       shift; cmd_edit "$@" ;;
+  rm|remove)  shift; cmd_rm "$@" ;;
+  --)         shift; cmd_exec "$@" ;;
+  -h|--help)  usage ;;
+  *)          cmd_exec "$@" ;;
+esac
