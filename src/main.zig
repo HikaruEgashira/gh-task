@@ -1,6 +1,7 @@
 const std = @import("std");
 const store = @import("store.zig");
 const kanban = @import("kanban.zig");
+const sync = @import("sync.zig");
 
 const usage_text =
     \\Usage: gh task <command> [options]
@@ -15,6 +16,8 @@ const usage_text =
     \\  move <id> <status>       Move task to column
     \\  edit <id> <new-title>    Edit task title
     \\  rm <id>                  Remove a task
+    \\  sync push <owner> <num>  Push tasks to GitHub Project
+    \\  sync pull <owner> <num>  Pull tasks from GitHub Project
     \\
     \\Statuses: todo, doing, done
     \\
@@ -57,6 +60,8 @@ pub fn main() !void {
         return runEdit(allocator, args[2..], out, err);
     } else if (std.mem.eql(u8, cmd, "rm") or std.mem.eql(u8, cmd, "remove")) {
         return runRemove(allocator, args[2..], out, err);
+    } else if (std.mem.eql(u8, cmd, "sync")) {
+        return runSync(allocator, args[2..], err);
     } else if (std.mem.eql(u8, cmd, "-h") or std.mem.eql(u8, cmd, "--help") or std.mem.eql(u8, cmd, "help")) {
         try out.writeAll(usage_text);
     } else {
@@ -188,6 +193,35 @@ fn runEdit(allocator: std.mem.Allocator, args: []const []const u8, out: std.fs.F
     };
 
     writeStr(out, "Updated #{d}: {s}\n", .{ id, title });
+}
+
+fn runSync(allocator: std.mem.Allocator, args: []const []const u8, err_file: std.fs.File) !void {
+    if (args.len < 3) {
+        try err_file.writeAll("Usage: gh task sync <push|pull> <owner> <project-number>\n");
+        std.process.exit(1);
+    }
+
+    const direction = args[0];
+    const owner = args[1];
+    const number = args[2];
+
+    var s = try loadStore(allocator);
+    defer s.deinit();
+
+    if (std.mem.eql(u8, direction, "push")) {
+        sync.syncPush(allocator, &s, owner, number) catch |e| {
+            writeStr(err_file, "Sync push failed: {any}\n", .{e});
+            std.process.exit(1);
+        };
+    } else if (std.mem.eql(u8, direction, "pull")) {
+        sync.syncPull(allocator, &s, owner, number) catch |e| {
+            writeStr(err_file, "Sync pull failed: {any}\n", .{e});
+            std.process.exit(1);
+        };
+    } else {
+        try err_file.writeAll("Usage: gh task sync <push|pull> <owner> <project-number>\n");
+        std.process.exit(1);
+    }
 }
 
 fn runRemove(allocator: std.mem.Allocator, args: []const []const u8, out: std.fs.File, err_file: std.fs.File) !void {
