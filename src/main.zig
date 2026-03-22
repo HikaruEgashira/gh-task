@@ -209,15 +209,9 @@ fn runSync(allocator: std.mem.Allocator, args: []const []const u8, err_file: std
     defer s.deinit();
 
     if (std.mem.eql(u8, direction, "push")) {
-        sync.syncPush(allocator, &s, owner, number) catch |e| {
-            writeStr(err_file, "Sync push failed: {any}\n", .{e});
-            std.process.exit(1);
-        };
+        sync.syncPush(allocator, &s, owner, number);
     } else if (std.mem.eql(u8, direction, "pull")) {
-        sync.syncPull(allocator, &s, owner, number) catch |e| {
-            writeStr(err_file, "Sync pull failed: {any}\n", .{e});
-            std.process.exit(1);
-        };
+        sync.syncPull(allocator, &s, owner, number);
     } else {
         try err_file.writeAll("Usage: gh task sync <push|pull> <owner> <project-number>\n");
         std.process.exit(1);
