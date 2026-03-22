@@ -1,7 +1,7 @@
 const std = @import("std");
 const store = @import("store.zig");
 
-pub fn syncPush(allocator: std.mem.Allocator, s: *store.Store, owner: []const u8, number: []const u8) void {
+pub fn push(allocator: std.mem.Allocator, s: *store.Store, owner: []const u8, number: []const u8) void {
     const out = std.fs.File.stdout();
 
     const project_id = getProjectId(allocator, owner, number);
@@ -32,11 +32,10 @@ pub fn syncPush(allocator: std.mem.Allocator, s: *store.Store, owner: []const u8
         for (existing) |item| {
             if (std.mem.eql(u8, item.title, task.title)) {
                 found = true;
-                const target = mapStatusToProject(task.status);
-                if (!std.mem.eql(u8, item.status, target)) {
-                    if (findOptionId(field_info.options, target)) |oid| {
+                if (!std.mem.eql(u8, item.status, task.status)) {
+                    if (findOptionId(field_info.options, task.status)) |oid| {
                         setItemStatus(allocator, project_id, item.id, field_info.field_id, oid);
-                        writeMsg(out, "  Updated: {s} -> {s}\n", .{ task.title, target });
+                        writeMsg(out, "  Updated: {s} -> {s}\n", .{ task.title, task.status });
                     }
                 }
                 break;
@@ -47,19 +46,29 @@ pub fn syncPush(allocator: std.mem.Allocator, s: *store.Store, owner: []const u8
             const item_id = createProjectItem(allocator, owner, number, task.title);
             defer allocator.free(item_id);
 
-            const target = mapStatusToProject(task.status);
-            if (findOptionId(field_info.options, target)) |oid| {
+            if (findOptionId(field_info.options, task.status)) |oid| {
                 setItemStatus(allocator, project_id, item_id, field_info.field_id, oid);
             }
-            writeMsg(out, "  Created: {s} [{s}]\n", .{ task.title, target });
+            writeMsg(out, "  Created: {s} [{s}]\n", .{ task.title, task.status });
         }
     }
 
-    out.writeAll("Sync push complete.\n") catch {};
+    out.writeAll("Push complete.\n") catch {};
 }
 
-pub fn syncPull(allocator: std.mem.Allocator, s: *store.Store, owner: []const u8, number: []const u8) void {
+pub fn pull(allocator: std.mem.Allocator, s: *store.Store, owner: []const u8, number: []const u8) void {
     const out = std.fs.File.stdout();
+
+    // Get project columns to set up TASKS.md sections
+    const field_info = getStatusFieldInfo(allocator, owner, number);
+    defer allocator.free(field_info.field_id);
+    defer {
+        for (field_info.options) |opt| {
+            allocator.free(opt.id);
+            allocator.free(opt.name);
+        }
+        allocator.free(field_info.options);
+    }
 
     const items = listProjectItems(allocator, owner, number);
     defer {
@@ -71,24 +80,34 @@ pub fn syncPull(allocator: std.mem.Allocator, s: *store.Store, owner: []const u8
         allocator.free(items);
     }
 
+    // Clear existing
     for (s.tasks.items) |task| {
         allocator.free(task.title);
+        allocator.free(task.status);
     }
     s.tasks.clearRetainingCapacity();
 
+    for (s.columns.items) |col| allocator.free(col);
+    s.columns.clearRetainingCapacity();
+
+    // Set columns from project
+    for (field_info.options) |opt| {
+        s.columns.append(allocator, allocator.dupe(u8, opt.name) catch fatal("Out of memory")) catch fatal("Out of memory");
+    }
+
+    // Add tasks
     for (items) |item| {
-        const status = mapStatusFromProject(item.status);
-        const title = allocator.dupe(u8, item.title) catch fatal("Out of memory");
+        const status_str = if (item.status.len > 0) item.status else s.firstColumn();
         s.tasks.append(allocator, .{
             .id = s.nextId(),
-            .status = status,
-            .title = title,
+            .status = allocator.dupe(u8, status_str) catch fatal("Out of memory"),
+            .title = allocator.dupe(u8, item.title) catch fatal("Out of memory"),
         }) catch fatal("Out of memory");
     }
 
     s.save() catch fatal("Failed to write TASKS.md");
 
-    writeMsg(out, "Pulled {d} items from project.\n", .{items.len});
+    writeMsg(out, "Pulled {d} items ({d} columns) from project.\n", .{ items.len, field_info.options.len });
 }
 
 // --- helpers ---
@@ -103,20 +122,6 @@ fn fatal(msg: []const u8) noreturn {
     std.fs.File.stderr().writeAll(msg) catch {};
     std.fs.File.stderr().writeAll("\n") catch {};
     std.process.exit(1);
-}
-
-fn mapStatusToProject(status: store.Status) []const u8 {
-    return switch (status) {
-        .todo => "Todo",
-        .doing => "In Progress",
-        .done => "Done",
-    };
-}
-
-fn mapStatusFromProject(status: []const u8) store.Status {
-    if (std.mem.eql(u8, status, "In Progress")) return .doing;
-    if (std.mem.eql(u8, status, "Done")) return .done;
-    return .todo;
 }
 
 const ProjectItem = struct { id: []const u8, title: []const u8, status: []const u8 };
@@ -157,8 +162,7 @@ fn getProjectId(allocator: std.mem.Allocator, owner: []const u8, number: []const
     const result = ghExec(allocator, &.{ "project", "view", number, "--owner", owner, "--format", "json" });
     defer allocator.free(result);
 
-    const parsed = std.json.parseFromSlice(std.json.Value, allocator, result, .{}) catch
-        fatal("Failed to parse project response");
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, result, .{}) catch fatal("Failed to parse project response");
     defer parsed.deinit();
 
     const id = parsed.value.object.get("id") orelse fatal("Project has no id field");
@@ -169,8 +173,7 @@ fn getStatusFieldInfo(allocator: std.mem.Allocator, owner: []const u8, number: [
     const result = ghExec(allocator, &.{ "project", "field-list", number, "--owner", owner, "--format", "json" });
     defer allocator.free(result);
 
-    const parsed = std.json.parseFromSlice(std.json.Value, allocator, result, .{}) catch
-        fatal("Failed to parse field list response");
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, result, .{}) catch fatal("Failed to parse field list response");
     defer parsed.deinit();
 
     const fields = parsed.value.object.get("fields") orelse fatal("No fields in project");
@@ -205,8 +208,7 @@ fn createProjectItem(allocator: std.mem.Allocator, owner: []const u8, number: []
     const result = ghExec(allocator, &.{ "project", "item-create", number, "--owner", owner, "--title", title, "--format", "json" });
     defer allocator.free(result);
 
-    const parsed = std.json.parseFromSlice(std.json.Value, allocator, result, .{}) catch
-        fatal("Failed to parse item-create response");
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, result, .{}) catch fatal("Failed to parse item-create response");
     defer parsed.deinit();
 
     const id = parsed.value.object.get("id") orelse fatal("Created item has no id");
@@ -225,7 +227,6 @@ fn findOptionId(options: []const StatusOption, name: []const u8) ?[]const u8 {
     return null;
 }
 
-/// Execute a gh CLI command. Exits with message on failure.
 fn ghExec(allocator: std.mem.Allocator, args: []const []const u8) []const u8 {
     var argv: std.ArrayList([]const u8) = .empty;
     defer argv.deinit(allocator);

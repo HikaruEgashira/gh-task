@@ -4,9 +4,15 @@ const store = @import("store.zig");
 const Color = struct {
     const reset = "\x1b[0m";
     const dim = "\x1b[2m";
-    const yellow = "\x1b[1;33m";
-    const cyan = "\x1b[1;36m";
-    const green = "\x1b[1;32m";
+    const bold = "\x1b[1m";
+    // Cycle through colors for N columns
+    const palette = [_][]const u8{
+        "\x1b[1;33m", // yellow
+        "\x1b[1;36m", // cyan
+        "\x1b[1;32m", // green
+        "\x1b[1;35m", // magenta
+        "\x1b[1;34m", // blue
+    };
 };
 
 fn getTermWidth() u16 {
@@ -16,71 +22,74 @@ fn getTermWidth() u16 {
     return 80;
 }
 
+const TaskEntry = struct { id: u32, title: []const u8 };
+
 pub fn render(s: *const store.Store, file: std.fs.File) !void {
-    const term_width: usize = getTermWidth();
-    const col_width = (term_width - 2) / 3;
-    const inner = col_width - 3;
-
-    const statuses = [_]store.Status{ .todo, .doing, .done };
-    const labels = [_][]const u8{ "TODO", "DOING", "DONE" };
-    const colors = [_][]const u8{ Color.yellow, Color.cyan, Color.green };
-
-    // Header
-    var hdr_buf: [1024]u8 = undefined;
-    for (statuses, 0..) |status, i| {
-        const count = s.countByStatus(status);
-        const hdr = std.fmt.bufPrint(&hdr_buf, " {s}{s} ({d}){s}", .{ colors[i], labels[i], count, Color.reset }) catch unreachable;
-        try file.writeAll(hdr);
-        const label_len = labels[i].len + 3 + countDigits(count);
-        if (inner > label_len) {
-            try writeSpaces(file, inner - label_len);
-        }
-        if (i < 2) try file.writeAll("\xe2\x94\x82"); // │
-    }
-    try file.writeAll("\n");
-
-    // Separator
-    for (0..3) |i| {
-        try file.writeAll(" ");
-        for (0..inner) |_| try file.writeAll("\xe2\x94\x80"); // ─
-        if (i < 2) try file.writeAll("\xe2\x94\xbc"); // ┼
-    }
-    try file.writeAll("\n");
-
-    // Collect per column
-    const allocator = s.allocator;
-    var todo: std.ArrayList(TaskEntry) = .empty;
-    defer todo.deinit(allocator);
-    var doing: std.ArrayList(TaskEntry) = .empty;
-    defer doing.deinit(allocator);
-    var done: std.ArrayList(TaskEntry) = .empty;
-    defer done.deinit(allocator);
-
-    for (s.tasks.items) |task| {
-        const list = switch (task.status) {
-            .todo => &todo,
-            .doing => &doing,
-            .done => &done,
-        };
-        try list.append(allocator, .{ .id = task.id, .title = task.title });
-    }
-
-    const max_rows = @max(todo.items.len, @max(doing.items.len, done.items.len));
-    if (max_rows == 0) {
-        var buf: [128]u8 = undefined;
-        const msg = std.fmt.bufPrint(&buf, " {s}(no tasks){s}\n", .{ Color.dim, Color.reset }) catch unreachable;
-        try file.writeAll(msg);
+    const ncols = s.columns.items.len;
+    if (ncols == 0) {
+        file.writeAll("No columns defined.\n") catch {};
         return;
     }
 
-    const columns = [_]*const std.ArrayList(TaskEntry){ &todo, &doing, &done };
+    const term_width: usize = getTermWidth();
+    const col_width = if (ncols > 0) (term_width -| (ncols - 1)) / ncols else term_width;
+    const inner = if (col_width > 3) col_width - 2 else 1;
+
+    // Header
+    for (s.columns.items, 0..) |col, i| {
+        const count = s.countByStatus(col);
+        const color = Color.palette[i % Color.palette.len];
+        var buf: [256]u8 = undefined;
+        const hdr = std.fmt.bufPrint(&buf, " {s}{s} ({d}){s}", .{ color, col, count, Color.reset }) catch unreachable;
+        file.writeAll(hdr) catch {};
+        const label_len = col.len + 3 + countDigits(count);
+        if (inner > label_len) writeSpaces(file, inner - label_len);
+        if (i < ncols - 1) file.writeAll("\xe2\x94\x82") catch {}; // │
+    }
+    file.writeAll("\n") catch {};
+
+    // Separator
+    for (0..ncols) |i| {
+        file.writeAll(" ") catch {};
+        for (0..inner) |_| file.writeAll("\xe2\x94\x80") catch {}; // ─
+        if (i < ncols - 1) file.writeAll("\xe2\x94\xbc") catch {}; // ┼
+    }
+    file.writeAll("\n") catch {};
+
+    // Collect tasks per column
+    const allocator = s.allocator;
+    var col_tasks = allocator.alloc(std.ArrayList(TaskEntry), ncols) catch return;
+    defer allocator.free(col_tasks);
+    for (col_tasks) |*ct| ct.* = .empty;
+    defer for (col_tasks) |*ct| ct.deinit(allocator);
+
+    for (s.tasks.items) |task| {
+        for (s.columns.items, 0..) |col, ci| {
+            if (std.mem.eql(u8, task.status, col)) {
+                col_tasks[ci].append(allocator, .{ .id = task.id, .title = task.title }) catch {};
+                break;
+            }
+        }
+    }
+
+    var max_rows: usize = 0;
+    for (col_tasks) |ct| {
+        if (ct.items.len > max_rows) max_rows = ct.items.len;
+    }
+
+    if (max_rows == 0) {
+        var buf: [128]u8 = undefined;
+        const msg = std.fmt.bufPrint(&buf, " {s}(no tasks){s}\n", .{ Color.dim, Color.reset }) catch unreachable;
+        file.writeAll(msg) catch {};
+        return;
+    }
 
     for (0..max_rows) |row| {
-        for (columns, 0..) |col, i| {
-            if (row < col.items.len) {
-                const entry = col.items[row];
+        for (col_tasks, 0..) |ct, ci| {
+            if (row < ct.items.len) {
+                const entry = ct.items[row];
                 const id_len = countDigits(entry.id);
-                const prefix_len = 1 + id_len + 1; // "#N "
+                const prefix_len = 1 + id_len + 1;
                 const max_title: usize = if (inner > prefix_len + 1) inner - prefix_len - 1 else 0;
                 const display_title = if (entry.title.len > max_title and max_title > 0)
                     entry.title[0..max_title]
@@ -89,24 +98,17 @@ pub fn render(s: *const store.Store, file: std.fs.File) !void {
 
                 var buf: [1024]u8 = undefined;
                 const cell = std.fmt.bufPrint(&buf, " {s}#{d}{s} {s}", .{ Color.dim, entry.id, Color.reset, display_title }) catch unreachable;
-                try file.writeAll(cell);
+                file.writeAll(cell) catch {};
                 const used = prefix_len + display_title.len;
-                if (inner > used) {
-                    try writeSpaces(file, inner - used);
-                }
+                if (inner > used) writeSpaces(file, inner - used);
             } else {
-                try writeSpaces(file, inner + 1);
+                writeSpaces(file, inner + 1);
             }
-            if (i < 2) try file.writeAll("\xe2\x94\x82"); // │
+            if (ci < ncols - 1) file.writeAll("\xe2\x94\x82") catch {}; // │
         }
-        try file.writeAll("\n");
+        file.writeAll("\n") catch {};
     }
 }
-
-const TaskEntry = struct {
-    id: u32,
-    title: []const u8,
-};
 
 fn countDigits(n: anytype) usize {
     if (n == 0) return 1;
@@ -119,12 +121,12 @@ fn countDigits(n: anytype) usize {
     return d;
 }
 
-fn writeSpaces(file: std.fs.File, n: usize) !void {
+fn writeSpaces(file: std.fs.File, n: usize) void {
     const spaces = "                                                                                ";
     var remaining = n;
     while (remaining > 0) {
         const chunk = @min(remaining, spaces.len);
-        try file.writeAll(spaces[0..chunk]);
+        file.writeAll(spaces[0..chunk]) catch {};
         remaining -= chunk;
     }
 }
