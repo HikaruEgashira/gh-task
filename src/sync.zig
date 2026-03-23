@@ -102,6 +102,7 @@ pub fn pull(allocator: std.mem.Allocator, s: *store.Store, owner: []const u8, nu
             .id = s.nextId(),
             .status = allocator.dupe(u8, status_str) catch fatal("Out of memory"),
             .title = allocator.dupe(u8, item.title) catch fatal("Out of memory"),
+            .checked = std.mem.eql(u8, status_str, s.columns.items[s.columns.items.len - 1]),
         }) catch fatal("Out of memory");
     }
 

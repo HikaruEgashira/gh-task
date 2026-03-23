@@ -4,6 +4,7 @@ pub const Task = struct {
     id: u32,
     status: []const u8, // dynamic: "Todo", "In Progress", "Done", etc.
     title: []const u8,
+    checked: bool,
 };
 
 /// Default columns when creating a new TASKS.md
@@ -69,43 +70,53 @@ pub const Store = struct {
                     const title = try self.allocator.dupe(u8, parsed.title);
                     const status_owned = try self.allocator.dupe(u8, status);
                     try self.tasks.append(self.allocator, .{
-                        .id = parsed.id,
+                        .id = parsed.id orelse 0,
                         .status = status_owned,
                         .title = title,
+                        .checked = parsed.checked,
                     });
                 }
             }
         }
+
+        try self.normalizeTaskIds();
     }
 
-    const ParsedLine = struct { id: u32, title: []const u8 };
+    const ParsedLine = struct {
+        id: ?u32,
+        title: []const u8,
+        checked: bool,
+    };
 
     fn parseLine(line: []const u8) ?ParsedLine {
         const prefix_unchecked = "- [ ] ";
         const prefix_checked = "- [x] ";
         var rest: []const u8 = undefined;
+        var checked = false;
 
         if (std.mem.startsWith(u8, line, prefix_unchecked)) {
             rest = line[prefix_unchecked.len..];
         } else if (std.mem.startsWith(u8, line, prefix_checked)) {
             rest = line[prefix_checked.len..];
+            checked = true;
         } else {
             return null;
         }
 
         const marker = "<!-- id:";
         const end_marker = " -->";
-        const marker_pos = std.mem.indexOf(u8, rest, marker) orelse return null;
-        const id_start = marker_pos + marker.len;
-        const id_end = std.mem.indexOfPos(u8, rest, id_start, end_marker) orelse return null;
+        var id: ?u32 = null;
+        var title = std.mem.trimRight(u8, rest, " \r");
 
-        const id_str = rest[id_start..id_end];
-        const id = std.fmt.parseInt(u32, id_str, 10) catch return null;
+        if (std.mem.indexOf(u8, rest, marker)) |marker_pos| {
+            const id_start = marker_pos + marker.len;
+            const id_end = std.mem.indexOfPos(u8, rest, id_start, end_marker) orelse return null;
+            const id_str = rest[id_start..id_end];
+            id = std.fmt.parseInt(u32, id_str, 10) catch return null;
+            title = std.mem.trimRight(u8, rest[0..marker_pos], " ");
+        }
 
-        var title = rest[0..marker_pos];
-        title = std.mem.trimRight(u8, title, " ");
-
-        return .{ .id = id, .title = title };
+        return .{ .id = id, .title = title, .checked = checked };
     }
 
     pub fn save(self: *Store) !void {
@@ -121,7 +132,7 @@ pub const Store = struct {
 
             for (self.tasks.items) |task| {
                 if (std.mem.eql(u8, task.status, col)) {
-                    const check: []const u8 = if (isLastColumn(self, col)) "x" else " ";
+                    const check: []const u8 = if (task.checked) "x" else " ";
                     var buf: [1024]u8 = undefined;
                     const line = std.fmt.bufPrint(&buf, "- [{s}] {s} <!-- id:{d} -->\n", .{ check, task.title, task.id }) catch unreachable;
                     try file.writeAll(line);
@@ -129,11 +140,6 @@ pub const Store = struct {
             }
             try file.writeAll("\n");
         }
-    }
-
-    fn isLastColumn(self: *const Store, col: []const u8) bool {
-        if (self.columns.items.len == 0) return false;
-        return std.mem.eql(u8, self.columns.items[self.columns.items.len - 1], col);
     }
 
     pub fn nextId(self: *const Store) u32 {
@@ -148,7 +154,12 @@ pub const Store = struct {
         const id = self.nextId();
         const owned_title = try self.allocator.dupe(u8, title);
         const owned_status = try self.allocator.dupe(u8, status);
-        try self.tasks.append(self.allocator, .{ .id = id, .status = owned_status, .title = owned_title });
+        try self.tasks.append(self.allocator, .{
+            .id = id,
+            .status = owned_status,
+            .title = owned_title,
+            .checked = self.shouldCheckForStatus(status),
+        });
         try self.save();
         return id;
     }
@@ -165,6 +176,7 @@ pub const Store = struct {
             if (task.id == id) {
                 self.allocator.free(task.status);
                 task.status = try self.allocator.dupe(u8, new_status);
+                task.checked = self.shouldCheckForStatus(new_status);
                 try self.save();
                 return;
             }
@@ -223,6 +235,33 @@ pub const Store = struct {
         }
         return null;
     }
+
+    fn normalizeTaskIds(self: *Store) !void {
+        var seen = std.AutoHashMap(u32, void).init(self.allocator);
+        defer seen.deinit();
+
+        for (self.tasks.items) |*task| {
+            if (task.id == 0) continue;
+            const entry = try seen.getOrPut(task.id);
+            if (entry.found_existing) {
+                task.id = 0;
+            }
+        }
+
+        var next_id: u32 = 1;
+        for (self.tasks.items) |*task| {
+            if (task.id != 0) continue;
+            while (seen.contains(next_id)) : (next_id += 1) {}
+            task.id = next_id;
+            try seen.put(next_id, {});
+            next_id += 1;
+        }
+    }
+
+    fn shouldCheckForStatus(self: *const Store, status: []const u8) bool {
+        if (self.columns.items.len == 0) return false;
+        return std.mem.eql(u8, self.columns.items[self.columns.items.len - 1], status);
+    }
 };
 
 fn eqlIgnoreCase(a: []const u8, b: []const u8) bool {
@@ -235,7 +274,8 @@ fn eqlIgnoreCase(a: []const u8, b: []const u8) bool {
 
 test "parse and save roundtrip" {
     const allocator = std.testing.allocator;
-    var s = Store.init(allocator, "/tmp/test_tasks.md");
+    const path = ".tmp/test_tasks.md";
+    var s = Store.init(allocator, path);
     defer s.deinit();
 
     // Set up columns
@@ -247,7 +287,7 @@ test "parse and save roundtrip" {
     _ = try s.add("Task two", "In Progress");
     _ = try s.add("Task three", "Done");
 
-    var s2 = Store.init(allocator, "/tmp/test_tasks.md");
+    var s2 = Store.init(allocator, path);
     defer s2.deinit();
     try s2.load();
 
@@ -255,6 +295,54 @@ test "parse and save roundtrip" {
     try std.testing.expectEqualStrings("Task one", s2.tasks.items[0].title);
     try std.testing.expectEqualStrings("In Progress", s2.tasks.items[1].status);
     try std.testing.expectEqual(@as(usize, 3), s2.columns.items.len);
+    try std.testing.expect(s2.tasks.items[2].checked);
 
-    std.fs.cwd().deleteFile("/tmp/test_tasks.md") catch {};
+    std.fs.cwd().deleteFile(path) catch {};
+}
+
+test "load tasks without explicit ids and preserve checkbox state" {
+    const allocator = std.testing.allocator;
+    const path = ".tmp/test_tasks_without_ids.md";
+
+    {
+        const file = try std.fs.cwd().createFile(path, .{ .truncate = true });
+        defer file.close();
+        try file.writeAll(
+            \\# Tasks
+            \\
+            \\## Active
+            \\- [ ] **Task A**
+            \\- [ ] **Task B** <!-- id:9 -->
+            \\
+            \\## Done
+            \\- [x] **Task C** - completed 2026-03-23
+            \\- [ ] **Task D**
+            \\
+        );
+    }
+
+    var s = Store.init(allocator, path);
+    defer s.deinit();
+    try s.load();
+
+    try std.testing.expectEqual(@as(usize, 4), s.tasks.items.len);
+    try std.testing.expectEqual(@as(u32, 1), s.tasks.items[0].id);
+    try std.testing.expectEqual(@as(u32, 9), s.tasks.items[1].id);
+    try std.testing.expectEqual(@as(u32, 2), s.tasks.items[2].id);
+    try std.testing.expect(s.tasks.items[2].checked);
+    try std.testing.expect(!s.tasks.items[3].checked);
+
+    try s.save();
+
+    var s2 = Store.init(allocator, path);
+    defer s2.deinit();
+    try s2.load();
+
+    try std.testing.expectEqual(@as(usize, 4), s2.tasks.items.len);
+    try std.testing.expectEqual(@as(u32, 1), s2.tasks.items[0].id);
+    try std.testing.expectEqual(@as(u32, 9), s2.tasks.items[1].id);
+    try std.testing.expect(s2.tasks.items[2].checked);
+    try std.testing.expect(!s2.tasks.items[3].checked);
+
+    std.fs.cwd().deleteFile(path) catch {};
 }
