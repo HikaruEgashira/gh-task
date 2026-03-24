@@ -10,6 +10,7 @@ pub const Color = struct {
 };
 
 fn getTermWidth() u16 {
+    if (comptime @import("builtin").os.tag == .windows) return 80;
     var ws: std.posix.winsize = undefined;
     const rc = std.posix.system.ioctl(std.posix.STDOUT_FILENO, std.posix.T.IOCGWINSZ, @intFromPtr(&ws));
     if (rc == 0) return ws.col;
