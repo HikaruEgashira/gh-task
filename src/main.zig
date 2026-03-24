@@ -22,12 +22,6 @@ const usage_text =
     \\
 ;
 
-fn writeStr(file: std.fs.File, comptime fmt: []const u8, args: anytype) void {
-    var buf: [4096]u8 = undefined;
-    const msg = std.fmt.bufPrint(&buf, fmt, args) catch unreachable;
-    file.writeAll(msg) catch {};
-}
-
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
@@ -36,53 +30,54 @@ pub fn main() !void {
     const args = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, args);
 
-    const out = std.fs.File.stdout();
-    const err = std.fs.File.stderr();
+    const stdout = std.fs.File.stdout();
 
-    if (args.len < 2) return runList(allocator, out);
+    if (args.len < 2) return runList(allocator, stdout);
 
     const cmd = args[1];
+    const rest = args[2..];
 
-    if (std.mem.eql(u8, cmd, "add")) {
-        return runAdd(allocator, args[2..], out, err);
-    } else if (std.mem.eql(u8, cmd, "list") or std.mem.eql(u8, cmd, "ls")) {
-        return runList(allocator, out);
-    } else if (std.mem.eql(u8, cmd, "view")) {
-        return runView(allocator, args[2..], out);
-    } else if (std.mem.eql(u8, cmd, "move")) {
-        return runMove(allocator, args[2..], out, err);
-    } else if (std.mem.eql(u8, cmd, "edit")) {
-        return runEdit(allocator, args[2..], out, err);
-    } else if (std.mem.eql(u8, cmd, "rm") or std.mem.eql(u8, cmd, "remove")) {
-        return runRemove(allocator, args[2..], out, err);
-    } else if (std.mem.eql(u8, cmd, "columns") or std.mem.eql(u8, cmd, "cols")) {
-        return runColumns(allocator, out);
-    } else if (std.mem.eql(u8, cmd, "push")) {
-        return runPushPull(allocator, args[2..], err, true);
-    } else if (std.mem.eql(u8, cmd, "pull")) {
-        return runPushPull(allocator, args[2..], err, false);
-    } else if (std.mem.eql(u8, cmd, "-h") or std.mem.eql(u8, cmd, "--help") or std.mem.eql(u8, cmd, "help")) {
-        try out.writeAll(usage_text);
-    } else {
-        writeStr(err, "Unknown command: {s}\n", .{cmd});
-        try err.writeAll(usage_text);
-        std.process.exit(1);
+    const commands = .{
+        .{ "add", runAdd },
+        .{ "list", runList_ },
+        .{ "ls", runList_ },
+        .{ "view", runView },
+        .{ "move", runMove },
+        .{ "edit", runEdit },
+        .{ "rm", runRemove },
+        .{ "remove", runRemove },
+        .{ "columns", runColumns },
+        .{ "cols", runColumns },
+        .{ "push", runSync },
+        .{ "pull", runSync },
+    };
+
+    inline for (commands) |entry| {
+        if (std.mem.eql(u8, cmd, entry[0])) {
+            return entry[1](allocator, cmd, rest, stdout);
+        }
     }
+
+    if (std.mem.eql(u8, cmd, "-h") or std.mem.eql(u8, cmd, "--help") or std.mem.eql(u8, cmd, "help")) {
+        return stdout.writeAll(usage_text);
+    }
+
+    die("Unknown command: {s}\n", .{cmd});
 }
 
-fn loadStore(allocator: std.mem.Allocator) !store.Store {
-    var s = store.Store.init(allocator, "TASKS.md");
-    try s.load();
-    return s;
+// --- commands ---
+
+fn runList_(allocator: std.mem.Allocator, _: []const u8, _: []const []const u8, stdout: std.fs.File) !void {
+    return runList(allocator, stdout);
 }
 
-fn runList(allocator: std.mem.Allocator, out: std.fs.File) !void {
+fn runList(allocator: std.mem.Allocator, stdout: std.fs.File) !void {
     var s = try loadStore(allocator);
     defer s.deinit();
-    try kanban.render(&s, out);
+    try kanban.render(&s, stdout);
 }
 
-fn runAdd(allocator: std.mem.Allocator, args: []const []const u8, out: std.fs.File, err_file: std.fs.File) !void {
+fn runAdd(allocator: std.mem.Allocator, _: []const u8, args: []const []const u8, stdout: std.fs.File) !void {
     var status_arg: ?[]const u8 = null;
     var title_parts: std.ArrayList([]const u8) = .empty;
     defer title_parts.deinit(allocator);
@@ -97,10 +92,7 @@ fn runAdd(allocator: std.mem.Allocator, args: []const []const u8, out: std.fs.Fi
         }
     }
 
-    if (title_parts.items.len == 0) {
-        try err_file.writeAll("Error: title is required\n");
-        std.process.exit(1);
-    }
+    if (title_parts.items.len == 0) die("Error: title is required\n", .{});
 
     const title = try std.mem.join(allocator, " ", title_parts.items);
     defer allocator.free(title);
@@ -109,120 +101,64 @@ fn runAdd(allocator: std.mem.Allocator, args: []const []const u8, out: std.fs.Fi
     defer s.deinit();
 
     const status = if (status_arg) |sa|
-        s.findColumn(sa) orelse {
-            writeStr(err_file, "Unknown column: {s}\nAvailable: ", .{sa});
-            for (s.columns.items, 0..) |col, ci| {
-                if (ci > 0) err_file.writeAll(", ") catch {};
-                err_file.writeAll(col) catch {};
-            }
-            err_file.writeAll("\n") catch {};
-            std.process.exit(1);
-        }
+        s.findColumn(sa) orelse dieUnknownColumn(&s, sa)
     else
         s.firstColumn();
 
     const id = try s.add(title, status);
-    writeStr(out, "Created #{d}: {s} [{s}]\n", .{ id, title, status });
+    print(stdout, "Created #{d}: {s} [{s}]\n", .{ id, title, status });
 }
 
-fn runMove(allocator: std.mem.Allocator, args: []const []const u8, out: std.fs.File, err_file: std.fs.File) !void {
-    if (args.len < 2) {
-        try err_file.writeAll("Usage: gh task move <id> <status>\n");
-        std.process.exit(1);
-    }
+fn runMove(allocator: std.mem.Allocator, _: []const u8, args: []const []const u8, stdout: std.fs.File) !void {
+    if (args.len < 2) die("Usage: gh task move <id> <status>\n", .{});
 
-    const id = std.fmt.parseInt(u32, args[0], 10) catch {
-        writeStr(err_file, "Invalid id: {s}\n", .{args[0]});
-        std.process.exit(1);
-    };
-
-    // Join remaining args as status name (e.g. "In Progress")
-    const status_query = std.mem.join(allocator, " ", args[1..]) catch {
-        try err_file.writeAll("Out of memory\n");
-        std.process.exit(1);
-    };
-    defer allocator.free(status_query);
+    const id = parseId(args[0]);
+    const query = try std.mem.join(allocator, " ", args[1..]);
+    defer allocator.free(query);
 
     var s = try loadStore(allocator);
     defer s.deinit();
 
-    const new_status = s.findColumn(status_query) orelse {
-        writeStr(err_file, "Unknown column: {s}\nAvailable: ", .{status_query});
-        for (s.columns.items, 0..) |col, ci| {
-            if (ci > 0) err_file.writeAll(", ") catch {};
-            err_file.writeAll(col) catch {};
-        }
-        err_file.writeAll("\n") catch {};
-        std.process.exit(1);
-    };
-
-    s.updateStatus(id, new_status) catch {
-        writeStr(err_file, "Task #{d} not found\n", .{id});
-        std.process.exit(1);
-    };
-
-    writeStr(out, "Moved #{d} -> {s}\n", .{ id, new_status });
+    const new_status = s.findColumn(query) orelse dieUnknownColumn(&s, query);
+    s.updateStatus(id, new_status) catch die("Task #{d} not found\n", .{id});
+    print(stdout, "Moved #{d} -> {s}\n", .{ id, new_status });
 }
 
-fn runEdit(allocator: std.mem.Allocator, args: []const []const u8, out: std.fs.File, err_file: std.fs.File) !void {
-    if (args.len < 2) {
-        try err_file.writeAll("Usage: gh task edit <id> <new-title>\n");
-        std.process.exit(1);
-    }
+fn runEdit(allocator: std.mem.Allocator, _: []const u8, args: []const []const u8, stdout: std.fs.File) !void {
+    if (args.len < 2) die("Usage: gh task edit <id> <new-title>\n", .{});
 
-    const id = std.fmt.parseInt(u32, args[0], 10) catch {
-        writeStr(err_file, "Invalid id: {s}\n", .{args[0]});
-        std.process.exit(1);
-    };
-
+    const id = parseId(args[0]);
     const title = try std.mem.join(allocator, " ", args[1..]);
     defer allocator.free(title);
 
     var s = try loadStore(allocator);
     defer s.deinit();
 
-    s.updateTitle(id, title) catch {
-        writeStr(err_file, "Task #{d} not found\n", .{id});
-        std.process.exit(1);
-    };
-
-    writeStr(out, "Updated #{d}: {s}\n", .{ id, title });
+    s.updateTitle(id, title) catch die("Task #{d} not found\n", .{id});
+    print(stdout, "Updated #{d}: {s}\n", .{ id, title });
 }
 
-fn runRemove(allocator: std.mem.Allocator, args: []const []const u8, out: std.fs.File, err_file: std.fs.File) !void {
-    if (args.len == 0) {
-        try err_file.writeAll("Error: task id is required\n");
-        std.process.exit(1);
-    }
+fn runRemove(allocator: std.mem.Allocator, _: []const u8, args: []const []const u8, stdout: std.fs.File) !void {
+    if (args.len == 0) die("Error: task id is required\n", .{});
 
-    const id = std.fmt.parseInt(u32, args[0], 10) catch {
-        writeStr(err_file, "Invalid id: {s}\n", .{args[0]});
-        std.process.exit(1);
-    };
+    const id = parseId(args[0]);
 
     var s = try loadStore(allocator);
     defer s.deinit();
 
-    const title = s.remove(id) catch {
-        writeStr(err_file, "Task #{d} not found\n", .{id});
-        std.process.exit(1);
-    };
+    const title = s.remove(id) catch die("Task #{d} not found\n", .{id});
     defer allocator.free(title);
-
-    writeStr(out, "Removed #{d}: {s}\n", .{ id, title });
+    print(stdout, "Removed #{d}: {s}\n", .{ id, title });
 }
 
-fn runView(allocator: std.mem.Allocator, args: []const []const u8, out: std.fs.File) !void {
+fn runView(allocator: std.mem.Allocator, _: []const u8, args: []const []const u8, stdout: std.fs.File) !void {
     var s = try loadStore(allocator);
     defer s.deinit();
 
-    const colors = [_][]const u8{ "\x1b[1;33m", "\x1b[1;36m", "\x1b[1;32m", "\x1b[1;35m", "\x1b[1;34m" };
-    const reset = "\x1b[0m";
-    const dim = "\x1b[2m";
+    const Color = kanban.Color;
 
     const query = if (args.len > 0) std.mem.join(allocator, " ", args) catch null else null;
     defer if (query) |q| allocator.free(q);
-
     const filter: ?[]const u8 = if (query) |q| s.findColumn(q) else null;
 
     for (s.columns.items, 0..) |col, ci| {
@@ -230,48 +166,72 @@ fn runView(allocator: std.mem.Allocator, args: []const []const u8, out: std.fs.F
             if (!std.mem.eql(u8, col, f)) continue;
         }
 
-        const count = s.countByStatus(col);
-        const color = colors[ci % colors.len];
-        writeStr(out, "\n{s}{s} ({d}){s}\n", .{ color, col, count, reset });
+        const color = Color.palette[ci % Color.palette.len];
+        print(stdout, "\n{s}{s} ({d}){s}\n", .{ color, col, s.countByStatus(col), Color.reset });
 
         var found = false;
         for (s.tasks.items) |task| {
             if (std.mem.eql(u8, task.status, col)) {
-                writeStr(out, "  {s}#{d}{s} {s}\n", .{ dim, task.id, reset, task.title });
+                print(stdout, "  {s}#{d}{s} {s}\n", .{ Color.dim, task.id, Color.reset, task.title });
                 found = true;
             }
         }
-        if (!found) {
-            writeStr(out, "  {s}(empty){s}\n", .{ dim, reset });
-        }
+        if (!found) print(stdout, "  {s}(empty){s}\n", .{ Color.dim, Color.reset });
     }
 }
 
-fn runColumns(allocator: std.mem.Allocator, out: std.fs.File) !void {
+fn runColumns(allocator: std.mem.Allocator, _: []const u8, _: []const []const u8, stdout: std.fs.File) !void {
     var s = try loadStore(allocator);
     defer s.deinit();
 
     for (s.columns.items, 0..) |col, i| {
-        const count = s.countByStatus(col);
-        writeStr(out, "{d}. {s} ({d})\n", .{ i + 1, col, count });
+        print(stdout, "{d}. {s} ({d})\n", .{ i + 1, col, s.countByStatus(col) });
     }
 }
 
-fn runPushPull(allocator: std.mem.Allocator, args: []const []const u8, err_file: std.fs.File, is_push: bool) !void {
-    if (args.len < 2) {
-        try err_file.writeAll("Usage: gh task push|pull <owner> <project-number>\n");
-        std.process.exit(1);
-    }
-
-    const owner = args[0];
-    const number = args[1];
+fn runSync(allocator: std.mem.Allocator, cmd: []const u8, args: []const []const u8, _: std.fs.File) !void {
+    if (args.len < 2) die("Usage: gh task push|pull <owner> <project-number>\n", .{});
 
     var s = try loadStore(allocator);
     defer s.deinit();
 
-    if (is_push) {
-        sync.push(allocator, &s, owner, number);
+    if (std.mem.eql(u8, cmd, "push")) {
+        sync.push(allocator, &s, args[0], args[1]);
     } else {
-        sync.pull(allocator, &s, owner, number);
+        sync.pull(allocator, &s, args[0], args[1]);
     }
+}
+
+// --- helpers ---
+
+fn loadStore(allocator: std.mem.Allocator) !store.Store {
+    var s = store.Store.init(allocator, "TASKS.md");
+    try s.load();
+    return s;
+}
+
+fn print(file: std.fs.File, comptime fmt: []const u8, args: anytype) void {
+    var buf: [4096]u8 = undefined;
+    const msg = std.fmt.bufPrint(&buf, fmt, args) catch return;
+    file.writeAll(msg) catch {};
+}
+
+fn parseId(arg: []const u8) u32 {
+    return std.fmt.parseInt(u32, arg, 10) catch die("Invalid id: {s}\n", .{arg});
+}
+
+fn dieUnknownColumn(s: *const store.Store, query: []const u8) noreturn {
+    const stderr = std.fs.File.stderr();
+    print(stderr, "Unknown column: {s}\nAvailable: ", .{query});
+    for (s.columns.items, 0..) |col, i| {
+        if (i > 0) stderr.writeAll(", ") catch {};
+        stderr.writeAll(col) catch {};
+    }
+    stderr.writeAll("\n") catch {};
+    std.process.exit(1);
+}
+
+fn die(comptime fmt: []const u8, args: anytype) noreturn {
+    print(std.fs.File.stderr(), fmt, args);
+    std.process.exit(1);
 }

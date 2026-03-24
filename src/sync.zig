@@ -7,25 +7,11 @@ pub fn push(allocator: std.mem.Allocator, s: *store.Store, owner: []const u8, nu
     const project_id = getProjectId(allocator, owner, number);
     defer allocator.free(project_id);
 
-    const field_info = getStatusFieldInfo(allocator, owner, number);
-    defer allocator.free(field_info.field_id);
-    defer {
-        for (field_info.options) |opt| {
-            allocator.free(opt.id);
-            allocator.free(opt.name);
-        }
-        allocator.free(field_info.options);
-    }
+    const field = getStatusFieldInfo(allocator, owner, number);
+    defer freeFieldInfo(allocator, field);
 
     const existing = listProjectItems(allocator, owner, number);
-    defer {
-        for (existing) |item| {
-            allocator.free(item.id);
-            allocator.free(item.title);
-            allocator.free(item.status);
-        }
-        allocator.free(existing);
-    }
+    defer freeItems(allocator, existing);
 
     for (s.tasks.items) |task| {
         var found = false;
@@ -33,9 +19,9 @@ pub fn push(allocator: std.mem.Allocator, s: *store.Store, owner: []const u8, nu
             if (std.mem.eql(u8, item.title, task.title)) {
                 found = true;
                 if (!std.mem.eql(u8, item.status, task.status)) {
-                    if (findOptionId(field_info.options, task.status)) |oid| {
-                        setItemStatus(allocator, project_id, item.id, field_info.field_id, oid);
-                        writeMsg(out, "  Updated: {s} -> {s}\n", .{ task.title, task.status });
+                    if (findOptionId(field.options, task.status)) |oid| {
+                        setItemStatus(allocator, project_id, item.id, field.field_id, oid);
+                        print(out, "  Updated: {s} -> {s}\n", .{ task.title, task.status });
                     }
                 }
                 break;
@@ -46,10 +32,10 @@ pub fn push(allocator: std.mem.Allocator, s: *store.Store, owner: []const u8, nu
             const item_id = createProjectItem(allocator, owner, number, task.title);
             defer allocator.free(item_id);
 
-            if (findOptionId(field_info.options, task.status)) |oid| {
-                setItemStatus(allocator, project_id, item_id, field_info.field_id, oid);
+            if (findOptionId(field.options, task.status)) |oid| {
+                setItemStatus(allocator, project_id, item_id, field.field_id, oid);
             }
-            writeMsg(out, "  Created: {s} [{s}]\n", .{ task.title, task.status });
+            print(out, "  Created: {s} [{s}]\n", .{ task.title, task.status });
         }
     }
 
@@ -59,26 +45,11 @@ pub fn push(allocator: std.mem.Allocator, s: *store.Store, owner: []const u8, nu
 pub fn pull(allocator: std.mem.Allocator, s: *store.Store, owner: []const u8, number: []const u8) void {
     const out = std.fs.File.stdout();
 
-    // Get project columns to set up TASKS.md sections
-    const field_info = getStatusFieldInfo(allocator, owner, number);
-    defer allocator.free(field_info.field_id);
-    defer {
-        for (field_info.options) |opt| {
-            allocator.free(opt.id);
-            allocator.free(opt.name);
-        }
-        allocator.free(field_info.options);
-    }
+    const field = getStatusFieldInfo(allocator, owner, number);
+    defer freeFieldInfo(allocator, field);
 
     const items = listProjectItems(allocator, owner, number);
-    defer {
-        for (items) |item| {
-            allocator.free(item.id);
-            allocator.free(item.title);
-            allocator.free(item.status);
-        }
-        allocator.free(items);
-    }
+    defer freeItems(allocator, items);
 
     // Clear existing
     for (s.tasks.items) |task| {
@@ -91,7 +62,7 @@ pub fn pull(allocator: std.mem.Allocator, s: *store.Store, owner: []const u8, nu
     s.columns.clearRetainingCapacity();
 
     // Set columns from project
-    for (field_info.options) |opt| {
+    for (field.options) |opt| {
         s.columns.append(allocator, allocator.dupe(u8, opt.name) catch fatal("Out of memory")) catch fatal("Out of memory");
     }
 
@@ -107,13 +78,38 @@ pub fn pull(allocator: std.mem.Allocator, s: *store.Store, owner: []const u8, nu
     }
 
     s.save() catch fatal("Failed to write TASKS.md");
-
-    writeMsg(out, "Pulled {d} items ({d} columns) from project.\n", .{ items.len, field_info.options.len });
+    print(out, "Pulled {d} items ({d} columns) from project.\n", .{ items.len, field.options.len });
 }
 
-// --- helpers ---
+// --- types ---
 
-fn writeMsg(file: std.fs.File, comptime fmt: []const u8, args: anytype) void {
+const ProjectItem = struct { id: []const u8, title: []const u8, status: []const u8 };
+const StatusOption = struct { id: []const u8, name: []const u8 };
+const FieldInfo = struct { field_id: []const u8, options: []StatusOption };
+
+// --- cleanup helpers ---
+
+fn freeFieldInfo(allocator: std.mem.Allocator, info: FieldInfo) void {
+    allocator.free(info.field_id);
+    for (info.options) |opt| {
+        allocator.free(opt.id);
+        allocator.free(opt.name);
+    }
+    allocator.free(info.options);
+}
+
+fn freeItems(allocator: std.mem.Allocator, items: []ProjectItem) void {
+    for (items) |item| {
+        allocator.free(item.id);
+        allocator.free(item.title);
+        allocator.free(item.status);
+    }
+    allocator.free(items);
+}
+
+// --- output ---
+
+fn print(file: std.fs.File, comptime fmt: []const u8, args: anytype) void {
     var buf: [512]u8 = undefined;
     const msg = std.fmt.bufPrint(&buf, fmt, args) catch return;
     file.writeAll(msg) catch {};
@@ -125,9 +121,7 @@ fn fatal(msg: []const u8) noreturn {
     std.process.exit(1);
 }
 
-const ProjectItem = struct { id: []const u8, title: []const u8, status: []const u8 };
-const StatusOption = struct { id: []const u8, name: []const u8 };
-const FieldInfo = struct { field_id: []const u8, options: []StatusOption };
+// --- GitHub API ---
 
 fn listProjectItems(allocator: std.mem.Allocator, owner: []const u8, number: []const u8) []ProjectItem {
     const result = ghExec(allocator, &.{ "project", "item-list", number, "--owner", owner, "--format", "json", "--limit", "100" });
@@ -143,8 +137,7 @@ fn listProjectItems(allocator: std.mem.Allocator, owner: []const u8, number: []c
         const obj = item.object;
         const id = obj.get("id") orelse continue;
         const title = obj.get("title") orelse continue;
-        const status_val = obj.get("status");
-        const status_str = if (status_val) |sv| switch (sv) {
+        const status_str = if (obj.get("status")) |sv| switch (sv) {
             .string => |ss| ss,
             else => "",
         } else "";
@@ -178,8 +171,8 @@ fn getStatusFieldInfo(allocator: std.mem.Allocator, owner: []const u8, number: [
     defer parsed.deinit();
 
     const fields = parsed.value.object.get("fields") orelse fatal("No fields in project");
-    for (fields.array.items) |field| {
-        const obj = field.object;
+    for (fields.array.items) |f| {
+        const obj = f.object;
         const name = obj.get("name") orelse continue;
         if (!std.mem.eql(u8, name.string, "Status")) continue;
 
