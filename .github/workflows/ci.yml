@@ -1,0 +1,53 @@
+name: CI
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  build:
+    timeout-minutes: 10
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        timeout-minutes: 5
+        with:
+          persist-credentials: false
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        timeout-minutes: 5
+        with:
+          version: 0.15.2
+      - name: Build
+        timeout-minutes: 5
+        run: zig build -Doptimize=ReleaseSafe
+      - name: Test
+        timeout-minutes: 5
+        run: zig build test
+      - name: Validate workflow YAML
+        timeout-minutes: 5
+        run: |
+          python3 -m venv "$RUNNER_TEMP/ci-venv"
+          "$RUNNER_TEMP/ci-venv/bin/pip" install --quiet --disable-pip-version-check pyyaml
+          "$RUNNER_TEMP/ci-venv/bin/python" - <<'PY'
+          import glob
+          import sys
+
+          import yaml
+
+          failed = False
+          for path in sorted(glob.glob(".github/workflows/*.yml") + glob.glob(".github/workflows/*.yaml")):
+              try:
+                  with open(path, encoding="utf-8") as handle:
+                      yaml.safe_load(handle)
+                  print(f"ok: {path}")
+              except Exception as exc:  # noqa: BLE001
+                  print(f"error: {path}: {exc}")
+                  failed = True
+          sys.exit(1 if failed else 0)
+          PY
