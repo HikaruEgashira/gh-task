@@ -29,6 +29,12 @@ jobs:
       - name: Test
         timeout-minutes: 5
         run: zig build test
+      - name: Test workflow pin validation
+        timeout-minutes: 5
+        run: python3 -m unittest discover -s tests -p 'test_*.py' -v
+      - name: Validate action pins
+        timeout-minutes: 5
+        run: python3 scripts/validate_workflows.py
       - name: Validate workflow YAML
         timeout-minutes: 5
         run: |

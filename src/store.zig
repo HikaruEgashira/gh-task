@@ -231,6 +231,7 @@ pub const Store = struct {
 test "parse and save roundtrip" {
     const allocator = std.testing.allocator;
     const path = ".tmp/test_tasks.md";
+    try std.fs.cwd().makePath(".tmp");
     var s = Store.init(allocator, path);
     defer s.deinit();
 
@@ -258,6 +259,7 @@ test "parse and save roundtrip" {
 test "load tasks without explicit ids and preserve checkbox state" {
     const allocator = std.testing.allocator;
     const path = ".tmp/test_tasks_without_ids.md";
+    try std.fs.cwd().makePath(".tmp");
 
     {
         const file = try std.fs.cwd().createFile(path, .{ .truncate = true });
