@@ -1,0 +1,14 @@
+name: Setup Zig
+description: Install a pinned Zig toolchain without a Node.js action runtime.
+inputs:
+  version:
+    description: Zig release to install.
+    required: true
+runs:
+  using: composite
+  steps:
+    - name: Install Zig
+      shell: bash
+      env:
+        ZIG_VERSION: ${{ inputs.version }}
+      run: python3 "$GITHUB_ACTION_PATH/install.py" "$ZIG_VERSION"
